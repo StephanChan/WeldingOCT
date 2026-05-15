@@ -30,11 +30,6 @@ class StageAxisSpec:
     init_speed_mm_s: float
 
 
-@dataclass(frozen=True)
-class LaserSpec:
-    aline_frequency_hz: int
-
-
 SYSTEM_MAGNIFICATION_4X = 2.85
 
 
@@ -76,10 +71,6 @@ STAGE_AXIS_SPECS = {
 }
 
 
-LASER_SPECS = {
-    "Axsun100k": LaserSpec(aline_frequency_hz=100000),
-    "Thorlabs200k": LaserSpec(aline_frequency_hz=200000),
-}
 
 
 AODO_TRIGGER_OUT_PFI = "PFI3"

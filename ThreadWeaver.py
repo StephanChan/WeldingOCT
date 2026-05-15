@@ -1092,6 +1092,7 @@ class WeaverThread(QThread):
                 message = "Sample FOV scan completed."
             else:
                 message = "Sample FOV scan stopped by user."
+        # Home X and Y stages here?
         self.wait_for_processing_barrier(label=f"finishing {acq_mode}", stop_if_run_unchecked=False)
         return(message)
 
