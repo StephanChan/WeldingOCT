@@ -19,10 +19,6 @@ Created on Sun Dec 10 20:14:40 2023
 # TODO: revisit pause handling so it does not depend on thread interruption.
 # TODO: add standalone dynamic processing workflow for a single B-line.
 # TODO: extend full-volume dynamic workflows and storage layout where offline dynamic processing is still incomplete.
-# TODO: add automated region scan workflows for organoid and slice use cases.
-# TODO: add standalone mosaic dynamic-processing workflow for a selected region.
-# TODO: extend scheduled longitudinal dynamic scans beyond the current timed plate workflow.
-
 import sys
 import numpy as np
 from queue import Queue
@@ -33,23 +29,22 @@ import PyQt5.QtCore as qc
 from PyQt5.QtCore import QObject, pyqtSignal
 from mainWindow import MainWindow
 from ActionFields import *
-from ActionTypes import AcqTypes, DnSActions, GPUActions, WeaverActions
+from ActionTypes import AcqTypes, GPUActions, WeaverActions
 from FileNaming import FileNaming
 from Generaic_functions import LOG
 import time
-from SampleLocator import UnifiedSampleScanner
 from Display_rendering import (
     render_aodo_waveform_ready,
     render_aline_ready,
     render_bline_ready,
     render_cscan_ready,
-    render_mosaic_ready,
 )
 from HardwareSpecs import PHOTONFOCUS_STATIC_NORMALIZATION_MEAN
 
 CONTINUOUS_ACQ_MODES = (
     AcqTypes.CONTINUOUS_ALINE,
     AcqTypes.CONTINUOUS_BLINE,
+    AcqTypes.TRIGGERED_ACQUIRE,
     AcqTypes.CONTINUOUS_CSCAN,
 )
 
@@ -57,22 +52,6 @@ FINITE_ACQ_MODES = (
     AcqTypes.FINITE_ALINE,
     AcqTypes.FINITE_BLINE,
     AcqTypes.FINITE_CSCAN,
-    AcqTypes.PLATE_PRESCAN,
-    AcqTypes.PLATE_SCAN,
-    AcqTypes.WELL_SCAN,
-    AcqTypes.TIMED_PLATE_SCAN,
-)
-
-LIVE_ONLY_MODES = (
-    AcqTypes.LOCATION_CAMERA_LIVE,
-    AcqTypes.MOSAIC,
-)
-
-MOSAIC_DISPLAY_MODES = (
-    AcqTypes.PLATE_PRESCAN,
-    AcqTypes.PLATE_SCAN,
-    AcqTypes.WELL_SCAN,
-    AcqTypes.TIMED_PLATE_SCAN,
 )
 # Shared raw-data ring buffer. More than two slots allows acquisition and processing to overlap safely.
 global memoryCount
@@ -107,25 +86,41 @@ DQueue = Queue()
 DbackQueue = Queue()
 # Queue carrying completed raw-data memory slots.
 DatabackQueue = Queue()
-MosaicQueue = Queue()
 
         
 # Thread wrappers inject shared queues, memory, logging, and the UI bridge.
 
-from ThreadCamera_DH import Camera
-class Camera_2(Camera):
-    def __init__(self, ui, log):
-        super().__init__()
+from CameraUi import CAMERA_DAHENG, CAMERA_HIK, CAMERA_PHOTONFOCUS
+from ThreadCamera import Camera as PhotonFocusCamera
+from ThreadCamera_DH import Camera as DahengCamera
+from ThreadCamera_HK import Camera as HiKCamera
+
+
+class Camera_2:
+    def __new__(cls, ui, log):
+        camera_name = ui.Camera.currentText()
+        if camera_name == CAMERA_DAHENG:
+            worker = DahengCamera()
+        elif camera_name == CAMERA_PHOTONFOCUS:
+            worker = PhotonFocusCamera()
+        elif camera_name == CAMERA_HIK:
+            worker = HiKCamera()
+        else:
+            raise ValueError(
+                "Unsupported camera %r. Expected one of: %s"
+                % (camera_name, ", ".join((CAMERA_DAHENG, CAMERA_PHOTONFOCUS, CAMERA_HIK)))
+            )
         global Memory
-        self.memoryCount = memoryCount
-        self.Memory = Memory
-        self.ui = ui
-        self.queue = DQueue
-        self.DbackQueue = DbackQueue
-        self.DatabackQueue = DatabackQueue
-        self.log = log
-        self.SIM = SIM    
-        self.ui_bridge = None
+        worker.memoryCount = memoryCount
+        worker.Memory = Memory
+        worker.ui = ui
+        worker.queue = DQueue
+        worker.DbackQueue = DbackQueue
+        worker.DatabackQueue = DatabackQueue
+        worker.log = log
+        worker.SIM = SIM
+        worker.ui_bridge = None
+        return worker
             
 
 from ThreadWeaver import WeaverThread
@@ -145,7 +140,6 @@ class WeaverThread_2(WeaverThread):
         self.GPUQueue = GPUQueue
         self.DQueue = DQueue
         self.GPU2weaverQueue = GPU2weaverQueue
-        self.MosaicQueue = MosaicQueue
         self.log = log
         self.ui_bridge = None
 
@@ -187,7 +181,6 @@ class DnSThread_2(DnSThread):
         super().__init__()
         self.ui = ui
         self.queue = DnSQueue
-        self.MosaicQueue = MosaicQueue
         self.log = log
         self.use_maya = use_maya
         self.ui_bridge = None
@@ -197,12 +190,12 @@ class DnSThread_2(DnSThread):
 class UiBridge(QObject):
     status_message = pyqtSignal(str)
     acquisition_controls_locked = pyqtSignal(bool)
+    run_button_checked = pyqtSignal(bool)
     cu_slice_value = pyqtSignal(int)
     time_reader_value = pyqtSignal(int)
     aline_ready = pyqtSignal(object)   # dict payload
     bline_ready = pyqtSignal(object)   # dict payload
     cscan_ready = pyqtSignal(object)   # dict payload
-    mosaic_ready = pyqtSignal(object)  # dict payload
     aodo_waveform_ready = pyqtSignal(object)  # dict payload
 
 
@@ -215,15 +208,9 @@ class GUI(MainWindow):
         self.log = LOG(self.ui)
         self.log.install_stream_redirects()
         
-        self.FOV_locations = []
-        self.sample_centers = []
-        self.raw_img = []
-        self.pixel_polygons = []
-        
         self.ui.RunButton.clicked.connect(self.run_task)
         self.ui.PauseButton.clicked.connect(self.Pause_task)
         self.ui.CenterGalvo.clicked.connect(self.CenterGalvo)
-        self.ui.SampleLocateButton.clicked.connect(self.LocateSample)
         # set window length for FFT
         # self.ui.PostSamples.valueChanged.connect(self.update_Dispersion)
         # self.ui.PreSamples.valueChanged.connect(self.update_Dispersion)
@@ -245,9 +232,25 @@ class GUI(MainWindow):
         self.ui.redoSurf.clicked.connect(self.redo_surface)
         self.ui.BG_DIR.textChanged.connect(self.update_background)
         self.ui.AlinesPerBline.valueChanged.connect(self.update_background)
+        self.ui.AlineAVG.valueChanged.connect(self.update_background)
         self.ui.offsetH.valueChanged.connect(self.update_background)
-        self.ui.NSamples.valueChanged.connect(self.update_background)
-        self.ui.offsetW.valueChanged.connect(self.update_background)
+        for name in ("NSamples_DH", "NSamples_PF", "NSamples_HK"):
+            widget = getattr(self.ui, name, None)
+            if widget is not None:
+                widget.valueChanged.connect(self.update_background)
+        for name in ("SpectralDS_DH", "SpectralDS_PF", "SpectralDS_HK"):
+            widget = getattr(self.ui, name, None)
+            if widget is not None:
+                widget.valueChanged.connect(self.update_background)
+                widget.valueChanged.connect(self.update_Dispersion)
+        for name in ("offsetW_DH", "offsetW_PF", "offsetW_HK"):
+            widget = getattr(self.ui, name, None)
+            if widget is not None:
+                widget.valueChanged.connect(self.update_background)
+        self.ui.Camera.currentTextChanged.connect(self.update_background)
+        self.ui.Camera.currentTextChanged.connect(self.update_Dispersion)
+        self.ui.ACQMode.currentTextChanged.connect(self.update_triggered_display_layout)
+        self.ui.AlinesPerBline.valueChanged.connect(self.update_triggered_display_layout)
         self.ui.InD_DIR.textChanged.connect(self.update_Dispersion)
         self.ui.Xmove2.clicked.connect(self.Xmove2)
         self.ui.Ymove2.clicked.connect(self.Ymove2)
@@ -277,36 +280,36 @@ class GUI(MainWindow):
         self.ui.SliceN.valueChanged.connect(self._on_slice_n_changed)
         
         # testing buttons
-        self.ui.TestButten1.clicked.connect(self.TestButton1Func)
-        self.ui.TestButten2.clicked.connect(self.TestButton2Func)
-        self.ui.TestButten3.clicked.connect(self.TestButton3Func)
+        # self.ui.TestButten1.clicked.connect(self.TestButton1Func)
+        # self.ui.TestButten2.clicked.connect(self.TestButton2Func)
+        # self.ui.TestButten3.clicked.connect(self.TestButton3Func)
 
         # UI bridge (must live on GUI thread)
         self._ui_bridge = UiBridge()
         self._ui_bridge.status_message.connect(self._on_status_message)
         self._ui_bridge.acquisition_controls_locked.connect(self._on_acquisition_controls_locked)
+        self._ui_bridge.run_button_checked.connect(self._on_run_button_checked)
         self._ui_bridge.cu_slice_value.connect(self._on_cu_slice_value)
         self._ui_bridge.time_reader_value.connect(self._on_time_reader_value)
         self._ui_bridge.aline_ready.connect(self._on_aline_ready)
         self._ui_bridge.bline_ready.connect(self._on_bline_ready)
         self._ui_bridge.cscan_ready.connect(self._on_cscan_ready)
-        self._ui_bridge.mosaic_ready.connect(self._on_mosaic_ready)
         self._ui_bridge.aodo_waveform_ready.connect(self._on_aodo_waveform_ready)
         self._on_slice_n_changed(self.ui.SliceN.value())
         self._last_display_payloads = {
             "aline": None,
             "bline": None,
             "cscan": None,
-            "mosaic": None,
         }
         self._acquisition_lock_depth = 0
         self._locked_widget_states = {}
+        self.update_triggered_display_layout()
         
         # Init all threads
         self.Init_allThreads()
         # Simple FPS limiter for rendering-heavy slots
         self._render_fps_limit = 30.0
-        self._last_render_t = {"aline": 0.0, "bline": 0.0, "cscan": 0.0, "mosaic": 0.0}
+        self._last_render_t = {"aline": 0.0, "bline": 0.0, "cscan": 0.0}
 
     def Init_allThreads(self):
         self.Weaver_thread = WeaverThread_2(self.ui, self.log)
@@ -388,8 +391,6 @@ class GUI(MainWindow):
         live_names = (
             "RunButton",
             "PauseButton",
-            "RepeatSampleButton",
-            "NextSampleButton",
             "Xmove2",
             "Ymove2",
             "Zmove2",
@@ -488,6 +489,35 @@ class GUI(MainWindow):
     def _on_acquisition_controls_locked(self, locked: bool):
         self.set_acquisition_controls_locked(locked)
 
+    def _on_run_button_checked(self, checked: bool):
+        self.ui.RunButton.setChecked(bool(checked))
+        self.ui.RunButton.setText("Stop" if checked else "Go")
+
+    def update_triggered_display_layout(self, *args):
+        layout = getattr(self.ui, "horizontalLayout", None)
+        if layout is None:
+            return
+        if self.ui.ACQMode.currentText() != AcqTypes.TRIGGERED_ACQUIRE:
+            layout.setStretch(0, 1)
+            layout.setStretch(1, 1)
+            return
+
+        try:
+            from ThreadDnS import TRIGGERED_PREALLOC_ALINES, TRIGGERED_PREVIEW_DOWNSAMPLE
+            xz_width = max(1, int(self.ui.AlinesPerBline.value()))
+            xy_width = max(1, int(TRIGGERED_PREALLOC_ALINES) // max(1, int(TRIGGERED_PREVIEW_DOWNSAMPLE)))
+            layout.setStretch(0, xz_width)
+            layout.setStretch(1, xy_width)
+            print(
+                "triggeredAcquire display layout ratio: "
+                f"XZ={xz_width}, XY={xy_width} "
+                f"(prealloc={TRIGGERED_PREALLOC_ALINES}, downsample={TRIGGERED_PREVIEW_DOWNSAMPLE})"
+            )
+        except Exception as error:
+            print(f"Failed to update triggeredAcquire display layout: {error}")
+            layout.setStretch(0, 1)
+            layout.setStretch(1, 1)
+
     def enqueue_weaver_action(self, action):
         self.set_acquisition_controls_locked(True)
         WeaverQueue.put(action)
@@ -500,6 +530,9 @@ class GUI(MainWindow):
 
     def _on_bline_ready(self, payload: dict):
         self._last_display_payloads["bline"] = payload
+        if payload.get("mode") == AcqTypes.TRIGGERED_ACQUIRE and payload.get("appended") is not None:
+            render_bline_ready(self.ui, payload)
+            return
         if not self._fps_ok("bline"):
             return
         render_bline_ready(self.ui, payload)
@@ -509,12 +542,6 @@ class GUI(MainWindow):
         if not self._fps_ok("cscan"):
             return
         render_cscan_ready(self.ui, payload)
-
-    def _on_mosaic_ready(self, payload: dict):
-        self._last_display_payloads["mosaic"] = payload
-        if not self._fps_ok("mosaic"):
-            return
-        render_mosaic_ready(self.ui, payload)
 
     def _on_aodo_waveform_ready(self, payload: dict):
         render_aodo_waveform_ready(self.ui, payload)
@@ -554,7 +581,7 @@ class GUI(MainWindow):
         
     def run_task(self):
         acq_mode = self.ui.ACQMode.currentText()
-        if acq_mode in CONTINUOUS_ACQ_MODES + LIVE_ONLY_MODES:
+        if acq_mode in CONTINUOUS_ACQ_MODES:
             if self.ui.RunButton.isChecked():
                 self.ui.RunButton.setText('Stop')
                 an_action = WeaverActionField(acq_mode, acq_mode=acq_mode)
@@ -569,49 +596,6 @@ class GUI(MainWindow):
                 an_action = WeaverActionField(acq_mode, acq_mode=acq_mode)
                 self.enqueue_weaver_action(an_action)
         
-    def LocateSample(self):
-        self.XHome()
-        self.YHome()
-        self.scanner = UnifiedSampleScanner(
-            self.ui.DIR.toPlainText(),
-            fov_w_mm=self.ui.XLength.value(),
-            fov_h_mm=self.ui.YLength.value(),
-            current_zpos=self.ui.ZPosition.value(),
-            y_step_um=self.ui.YStepSize.value(),
-            stage_bounds=(
-                self.ui.Xmin.value(),
-                self.ui.Xmax.value(),
-                self.ui.Ymin.value(),
-                self.ui.Ymax.value(),
-            ),
-        )
-        if not self.scanner.exec_():
-            self.ui.sampleSelector.clear()
-            self.ui.sampleSelector.addItem("No Samples Found")
-            return
-
-        FOV_locations = self.scanner.generated_locations
-        sample_centers = self.scanner.sample_centers
-        raw_img = self.scanner.final_raw_img
-        pixel_polygons = self.scanner.final_polygons
-        """Updates the combo box content on the main thread."""
-        self.ui.sampleSelector.clear()
-        if len(sample_centers) == 0:
-            self.ui.sampleSelector.addItem("No Samples Found")
-            return
-        else:
-            for i in range(len(sample_centers)):
-                self.ui.sampleSelector.addItem(f"Sample {i+1}")
-        # print(self.sample_centers)
-        # print(FOV_locations)
-        # print(sample_centers)
-        an_action = WeaverActionField(
-            AcqTypes.PLATE_PRESCAN,
-            acq_mode=AcqTypes.PLATE_PRESCAN,
-            context=[FOV_locations, sample_centers, raw_img, pixel_polygons],
-        )
-        self.enqueue_weaver_action(an_action)
-
     def InitStages(self):
         an_action = AODOActionField('Init')
         AODOQueue.put(an_action)
@@ -764,7 +748,7 @@ class GUI(MainWindow):
             payload = self._last_display_payloads.get("aline")
             if payload is not None:
                 render_aline_ready(self.ui, payload)
-        elif acq_mode in ["FiniteBline", "ContinuousBline"]:
+        elif acq_mode in ["FiniteBline", "ContinuousBline", AcqTypes.TRIGGERED_ACQUIRE]:
             payload = self._last_display_payloads.get("bline")
             if payload is not None:
                 render_bline_ready(self.ui, payload)
@@ -772,14 +756,7 @@ class GUI(MainWindow):
             payload = self._last_display_payloads.get("cscan")
             if payload is not None:
                 render_cscan_ready(self.ui, payload)
-        elif acq_mode in MOSAIC_DISPLAY_MODES:
-            payload = self._last_display_payloads.get("mosaic")
-            if payload is not None:
-                render_mosaic_ready(self.ui, payload)
 
-    def Update_contrast_Mosaic(self):
-        self.Update_contrast()
-            
     def Update_contrast_Dyn(self):
         self.Update_contrast()
         
@@ -810,20 +787,6 @@ class GUI(MainWindow):
     #     an_action = DActionField('UninitBoard')
     #     DQueue.put(an_action)
     
-    def TestButton1Func(self):
-        context = [[0, 0], [10, 100]]
-        an_action = DnSActionField(DnSActions.INIT_MOSAIC, data = None, context = context)
-        DnSQueue.put(an_action)
-        
-    def TestButton2Func(self):
-        context = [[1, 1], [10, 100]]
-        an_action = DnSActionField(DnSActions.MOSAIC, data = np.ones([300*1700,150],dtype=np.float32)*50, context = context)
-        DnSQueue.put(an_action)
-    
-    def TestButton3Func(self):
-        an_action = DnSActionField(DnSActions.DISPLAY_MOSAIC)
-        DnSQueue.put(an_action)
-        
     def closeEvent(self, event):
         print('Exiting all threads')
         self.ui.statusbar.showMessage('Closing: stopping acquisition and worker threads...')

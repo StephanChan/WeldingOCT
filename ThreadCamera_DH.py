@@ -15,6 +15,12 @@ from Generaic_functions import *  # Shared plotting and waveform helpers used by
 import matplotlib.pyplot as plt
 from ActionFields import DbackActionField, DActionField
 import matplotlib.pyplot as plt
+from CameraUi import (
+    camera_sample_count,
+    downsample_spectral_axis,
+    raw_camera_sample_count,
+    spectral_downsample,
+)
 global SIM
 # Fall back to simulation when the Daheng SDK cannot be imported.
 try:
@@ -216,11 +222,13 @@ class Camera(QThread):
                     print(ex)
     
     def ConfigureBoard(self):
-        self.AlinesPerBline = self.ui.AlinesPerBline.value()
-        self.NSamples_DH = self.ui.NSamples_DH.value()
+        self.AlinesPerBline = self.ui.AlinesPerBline.value() * max(1, int(self.ui.AlineAVG.value()))
+        self.NSamples_DH = raw_camera_sample_count(self.ui)
+        self.SpectralDS = spectral_downsample(self.ui)
+        self.ProcessedSamples = camera_sample_count(self.ui)
         if self.ui.ACQMode.currentText() in ['FiniteBline', 'FiniteAline']:
             self.BlinesPerAcq = self.ui.BlineAVG.value() 
-        elif self.ui.ACQMode.currentText() in ['ContinuousBline', 'ContinuousAline','ContinuousCscan']:
+        elif self.ui.ACQMode.currentText() in ['ContinuousBline', 'triggeredAcquire', 'ContinuousAline','ContinuousCscan']:
             self.BlinesPerAcq = CONTINUOUS
         elif self.ui.ACQMode.currentText() in ['FiniteCscan','PlateScan','PlatePreScan', 'WellScan','TimedPlateScan']:
             self.BlinesPerAcq = self.ui.Ypixels.value() * self.ui.BlineAVG.value()
@@ -338,6 +346,7 @@ class Camera(QThread):
                                 t_view = time.perf_counter()
                                 Bline = buf.get_numpy_array()
                                 add_profile("numpy_view", time.perf_counter() - t_view)
+                        Bline = downsample_spectral_axis(Bline, self.SpectralDS, axis=0)
 
                         t_write = time.perf_counter()
                         self.write_bline_to_memory(Bline, memory_slot, frame_index)
@@ -504,10 +513,10 @@ class Camera(QThread):
             
             if self.ui.PixelFormat_display_DH.text() in ['Mono8']:
                 # Bline = np.uint8(np.random.rand(self.ui.AlinesPerBline.value(), self.NSamples_DH)*np.random.randint(255))
-                Bline = np.uint8(np.zeros([self.ui.AlinesPerBline.value(), self.NSamples_DH]))
+                Bline = np.uint8(np.zeros([self.AlinesPerBline, self.ProcessedSamples]))
             else:
                 # Bline = np.uint16(np.random.rand(self.ui.AlinesPerBline.value(), self.NSamples_DH)*np.random.randint(4096))
-                Bline = np.uint16(np.zeros([self.ui.AlinesPerBline.value(), self.NSamples_DH]))
+                Bline = np.uint16(np.zeros([self.AlinesPerBline, self.ProcessedSamples]))
             # print('camera outputs:', Bline[0,0:20])
             # print(BlinesCount, self.BlinesPerAcq)
             self.Memory[self.MemoryLoc][BlinesCount % NBlines] = Bline

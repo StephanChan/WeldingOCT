@@ -37,6 +37,12 @@ except Exception as error:
 
 from ActionFields import DbackActionField, DActionField
 import traceback
+from CameraUi import (
+    camera_sample_count,
+    downsample_spectral_axis,
+    raw_camera_sample_count,
+    spectral_downsample,
+)
 
 CONTINUOUS = 0x7FFFFFFF
 
@@ -157,11 +163,13 @@ class Camera(QThread):
                 # self.log.write(message)
         
     def ConfigureBoard(self):
-        self.AlinesPerBline = self.ui.AlinesPerBline.value()
-        self.NSamples = self.ui.NSamples.value()
+        self.AlinesPerBline = self.ui.AlinesPerBline.value() * max(1, int(self.ui.AlineAVG.value()))
+        self.NSamples = raw_camera_sample_count(self.ui)
+        self.SpectralDS = spectral_downsample(self.ui)
+        self.ProcessedSamples = camera_sample_count(self.ui)
         if self.ui.ACQMode.currentText() in ['FiniteBline', 'FiniteAline']:
             self.BlinesPerAcq = self.ui.BlineAVG.value() 
-        elif self.ui.ACQMode.currentText() in ['ContinuousBline', 'ContinuousAline','ContinuousCscan']:
+        elif self.ui.ACQMode.currentText() in ['ContinuousBline', 'triggeredAcquire', 'ContinuousAline','ContinuousCscan']:
             self.BlinesPerAcq = CONTINUOUS
         elif self.ui.ACQMode.currentText() in ['FiniteCscan']:
             self.BlinesPerAcq = self.ui.Ypixels.value() * self.ui.BlineAVG.value()
@@ -181,46 +189,50 @@ class Camera(QThread):
                 pfResult = self.pfCam.SetFeatureInt("AcquisitionFrameCount", self.BlinesPerAcq)
                 if pfResult != pf.Error.NONE:
                     self.ExitWithErrorPrompt("Could not set acquisition Frame Count", pfResult)
-            elif self.ui.ACQMode.currentText() in ['ContinuousBline', 'ContinuousAline','ContinuousCscan']:
+            elif self.ui.ACQMode.currentText() in ['ContinuousBline', 'triggeredAcquire', 'ContinuousAline','ContinuousCscan']:
                 pfResult = self.pfCam.SetFeatureEnum("AcquisitionMode", "Continuous")
                 if pfResult != pf.Error.NONE:
                     self.ExitWithErrorPrompt("Could not set acquisitionMode", pfResult)
             
-            pfResult = self.pfCam.SetFeatureEnum("AcquisitionStatusSelector", self.ui.AcquisitionStatusSelector.currentText())
+            pfResult = self.pfCam.SetFeatureEnum("AcquisitionStatusSelector", self.ui.AcquisitionStatusSelector_PF.currentText())
             if pfResult != pf.Error.NONE:
                 self.ExitWithErrorPrompt("Could not set AcquisitionStatusSelector feature parameters", pfResult)
                 
-            pfResult = self.pfCam.SetFeatureEnum("TriggerSelector", self.ui.TriggerSelector.currentText())
+            pfResult = self.pfCam.SetFeatureEnum("TriggerSelector", self.ui.TriggerSelector_PF.currentText())
             if pfResult != pf.Error.NONE:
                 self.ExitWithErrorPrompt("Could not set TriggerSelector feature parameters", pfResult)
                 
-            pfResult = self.pfCam.SetFeatureEnum("TriggerMode", self.ui.TriggerON.currentText())
+            pfResult = self.pfCam.SetFeatureEnum("TriggerMode", self.ui.TriggerON_PF.currentText())
             if pfResult != pf.Error.NONE:
                 self.ExitWithErrorPrompt("Could not set TriggerMode feature parameters", pfResult)
                 
-            pfResult = self.pfCam.SetFeatureEnum("TriggerSource", self.ui.TriggerSource.currentText())
+            pfResult = self.pfCam.SetFeatureEnum("TriggerSource", self.ui.TriggerSource_PF.currentText())
             if pfResult != pf.Error.NONE:
                 self.ExitWithErrorPrompt("Could not set TriggerSource feature parameters", pfResult)
+
+            pfResult = self.pfCam.SetFeatureEnum("TriggerActivation", self.ui.TriggerActivation_PF.currentText())
+            if pfResult != pf.Error.NONE:
+                self.ExitWithErrorPrompt("Could not set TriggerActivation feature parameters", pfResult)
                 
-            pfResult = self.pfCam.SetFeatureFloat("ExposureTime", self.ui.Exposure.value()*1000)
+            pfResult = self.pfCam.SetFeatureFloat("ExposureTime", self.ui.Exposure_PF.value()*1000)
             if pfResult != pf.Error.NONE:
                 self.ExitWithErrorPrompt("Could not set exposure time", pfResult)
             pfResult, pfFeatureParam =self.pfCam.GetFeatureFloat("ExposureTime")
             if pfResult != pf.Error.NONE:
                 self.ExitWithErrorPrompt("Could not get ExposureTime", pfResult)
-            self.ui.Exposure_display.setValue(pfFeatureParam/1000)
+            self.ui.Exposure_display_PF.setValue(pfFeatureParam/1000)
             
             pfResult = self.pfCam.SetFeatureEnum("ExposureMode", "Timed")
             if pfResult != pf.Error.NONE:
                 self.ExitWithErrorPrompt("Could not set ExposureMode", pfResult)
                 
-            pfResult = self.pfCam.SetFeatureEnum("DigitalGain", self.ui.DGain.currentText())
+            pfResult = self.pfCam.SetFeatureEnum("DigitalGain", self.ui.DGain_PF.currentText())
             if pfResult != pf.Error.NONE:
                 self.ExitWithErrorPrompt("Could not set DigitalGain", pfResult)
             pfResult, pfFeatureParam =self.pfCam.GetFeatureEnum("DigitalGain")
             if pfResult != pf.Error.NONE:
                 self.ExitWithErrorPrompt("Could not get Digital Gain", pfResult)
-            self.ui.DGain_display.setText(pfFeatureParam)
+            self.ui.DGain_display_PF.setText(pfFeatureParam)
             
             #Check DoubleRate_Enable feature is present
             if any(elem.Name == "DoubleRate_Enable" for elem in featureList):
@@ -230,25 +242,25 @@ class Camera(QThread):
                     self.ExitWithErrorPrompt("Failed to set DoubleRate_Enable", pfResult)
     
             #Set Mono8 pixel format
-            pfResult = self.pfCam.SetFeatureEnum("PixelFormat", self.ui.PixelFormat.currentText())
+            pfResult = self.pfCam.SetFeatureEnum("PixelFormat", self.ui.PixelFormat_PF.currentText())
             if pfResult != pf.Error.NONE:
                 self.ExitWithErrorPrompt("Could not set PixelFormat", pfResult)
             pfResult, pfFeatureParam =self.pfCam.GetFeatureEnum("PixelFormat")
             if pfResult != pf.Error.NONE:
                 self.ExitWithErrorPrompt("Could not get pixel format", pfResult)
-            self.ui.PixelFormat_display.setText(pfFeatureParam)
+            self.ui.PixelFormat_display_PF.setText(pfFeatureParam)
     
     
-            pfResult = self.pfCam.SetFeatureInt("Width", self.ui.NSamples.value())
+            pfResult = self.pfCam.SetFeatureInt("Width", self.NSamples)
             if pfResult != pf.Error.NONE:
                 self.ExitWithErrorPrompt("Error setting width", pfResult)
             
-            pfResult = self.pfCam.SetFeatureInt("OffsetX", self.ui.offsetW.value())
+            pfResult = self.pfCam.SetFeatureInt("OffsetX", self.ui.offsetW_PF.value())
             if pfResult != pf.Error.NONE:
                 self.ExitWithErrorPrompt("Error setting X offset", pfResult)
     
     
-            pfResult = self.pfCam.SetFeatureInt("Height", self.ui.AlinesPerBline.value())
+            pfResult = self.pfCam.SetFeatureInt("Height", self.AlinesPerBline)
             if pfResult != pf.Error.NONE:
                 self.ExitWithErrorPrompt("Error setting Height", pfResult)
             
@@ -258,7 +270,7 @@ class Camera(QThread):
             
             # get frame rate
             pfResult, pfFeatureParam = self.pfCam.GetFeatureFloat("AcquisitionFrameRateMax")
-            self.ui.FrameRate.setValue(pfFeatureParam)
+            self.ui.FrameRate_PF.setValue(pfFeatureParam)
             
             self.SetupStream()
             self.pfImageUnpacked = pf.PFImage()
@@ -278,7 +290,8 @@ class Camera(QThread):
             pfResult, pfFeatureParam = self.pfCam.GetFeatureFloat("DeviceTemperature")
             if pfResult != pf.Error.NONE:
                 self.ExitWithErrorPrompt("Could not get teporature feature parameters", pfResult)
-            self.ui.Temporature.setValue(pfFeatureParam)
+            if hasattr(self.ui, "Temporature_PF"):
+                self.ui.Temporature_PF.setValue(pfFeatureParam)
         
     def SetupStream(self):
         #Create stream depending on camera type
@@ -320,13 +333,14 @@ class Camera(QThread):
                 t1=time.time()
                 pfBuffer.GetImage(pfImage)
                 t2=time.time()
-                if self.ui.PixelFormat_display.text() in ['Mono8']:
+                if self.ui.PixelFormat_display_PF.text() in ['Mono8']:
                     Bline = np.array(pfImage, copy = False)
                 else:
                     pfResult = pfImage.ConvertTo(self.pfImageUnpacked)
                     if pfResult != pf.Error.NONE:
                         self.ExitWithErrorPrompt("Error unpacking image: ", pfResult)
                     Bline = np.array(self.pfImageUnpacked, copy = False)
+                Bline = downsample_spectral_axis(Bline, self.SpectralDS, axis=1)
                 
                 # print(Bline[0:10,0:5])
 
@@ -396,10 +410,10 @@ class Camera(QThread):
         while BlinesCount < self.BlinesPerAcq and self.ui.RunButton.isChecked():
             # t0=time.time()
             
-            if self.ui.PixelFormat_display.text() in ['Mono8']:
-                Bline = np.uint8(np.random.rand(self.ui.AlinesPerBline.value(), self.NSamples)*255)
+            if self.ui.PixelFormat_display_PF.text() in ['Mono8']:
+                Bline = np.uint8(np.random.rand(self.AlinesPerBline, self.ProcessedSamples)*255)
             else:
-                Bline = np.uint16(np.random.rand(self.ui.AlinesPerBline.value(), self.NSamples)*65535)
+                Bline = np.uint16(np.random.rand(self.AlinesPerBline, self.ProcessedSamples)*65535)
             # print('camera outputs:', Bline[0,0:20])
             # print(BlinesCount, self.BlinesPerAcq)
             self.Memory[self.MemoryLoc][BlinesCount % NBlines] = Bline

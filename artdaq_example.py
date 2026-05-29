@@ -63,30 +63,30 @@ class AODO(object):
     def config(self):
         self.AOtask = ni.Task('AOtask') 
         self.DOtask = ni.Task('DOtask')
-        AOwaveform1 = np.linspace(0,0.1,400)
-        AOwaveform2 = np.linspace(0.1,0,400)
+        AOwaveform1 = np.linspace(0,0.1,10000)
+        AOwaveform2 = np.linspace(0.1,0,10000)
         self.AOwaveform = np.append(AOwaveform1,AOwaveform2)
         # print(self.AOwaveform.shape, AOwaveform1.shape, AOwaveform2.shape)
-        self.AOtask.ao_channels.add_ao_voltage_chan(physical_channel='Galvo/ao1', \
+        self.AOtask.ao_channels.add_ao_voltage_chan(physical_channel='Galvo/ao0', \
                                               min_val=- 10.0, max_val=10.0, \
                                               units=ni.constants.VoltageUnits.VOLTS)
         # self.AOtask.out_stream.regen_mode = RegenerationMode.ALLOW_REGENERATION
-        self.AOtask.timing.cfg_samp_clk_timing(rate=900, \
+        self.AOtask.timing.cfg_samp_clk_timing(rate=20000, \
                                         # source='/AODO/PFI0', \
                                             # active_edge= Edge.FALLING,\
-                                          sample_mode=Atype.FINITE,samps_per_chan=len(self.AOwaveform))
+                                          sample_mode=Atype.CONTINUOUS,samps_per_chan=len(self.AOwaveform))
         # AOtask.triggers.sync_type.MASTER = True
         # self.AOtask.triggers.start_trigger.cfg_dig_edge_start_trig("/AODO/PFI0")
         self.AOtask.export_signals.export_signal(signal_id = Signal.START_TRIGGER, output_terminal = '/Galvo/PFI3')
         # terminal_name = get_terminal_name_with_dev_prefix(self.AOtask, "ao/StartTrigger")
 
     
-        self.DOtask.do_channels.add_do_chan(lines='Galvo/port0/line1')
+        self.DOtask.do_channels.add_do_chan(lines='Galvo/port0/line0')
         # self.DOtask.out_stream.regen_mode = RegenerationMode.ALLOW_REGENERATION
-        self.DOtask.timing.cfg_samp_clk_timing(rate=900, \
+        self.DOtask.timing.cfg_samp_clk_timing(rate=20000, \
                                         # source='/AODO/PFI0', \
                                             # active_edge= Edge.FALLING,\
-                                          sample_mode=Atype.FINITE,samps_per_chan=len(self.AOwaveform))
+                                          sample_mode=Atype.CONTINUOUS,samps_per_chan=len(self.AOwaveform))
         self.DOtask.triggers.start_trigger.cfg_dig_edge_start_trig('/Galvo/PFI7')
         # self.DOtask.triggers.start_trigger.cfg_dig_edge_start_trig("/AODO/PFI0")
         
@@ -96,7 +96,7 @@ class AODO(object):
         # self.DOwaveform = np.zeros(len(self.AOwaveform), dtype = np.uint32)
         self.DOwaveform = np.ones([self.AOwaveform.shape[0]//2, 2],dtype = np.uint32)
         self.DOwaveform[:,1] = 0
-        self.DOwaveform=self.DOwaveform.flatten()*pow(2,1)
+        self.DOwaveform=self.DOwaveform.flatten()*pow(2,0)
         # self.DOtask.out_stream.regen_mode = RegenerationMode.ALLOW_REGENERATION
         # self.AOtask.out_stream.regen_mode = RegenerationMode.ALLOW_REGENERATION
         # actual_sampling_rate = self.AOtask.timing.samp_clk_rate
@@ -107,8 +107,11 @@ class AODO(object):
         self.DOtask.start()
         self.AOtask.start()
     def stop(self):
-        self.DOtask.wait_until_done(timeout = 5)
-        self.AOtask.wait_until_done(timeout = 5)
+        try:
+            self.DOtask.wait_until_done(timeout = 100)
+            self.AOtask.wait_until_done(timeout = 100)
+        except:
+            pass
         self.DOtask.stop()
        
         self.AOtask.stop()

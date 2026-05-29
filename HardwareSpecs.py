@@ -21,7 +21,6 @@ class CameraSpec:
     name: str
     pixel_size_um: float
     max_height_px: int
-    frame_rate_multiplier: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -58,9 +57,11 @@ OBJECTIVE_SPECS = {
 
 
 CAMERA_SPECS = {
-    "PhotonFocus": CameraSpec(name="PhotonFocus", pixel_size_um=9.0, max_height_px=1100),
-    "XingTu": CameraSpec(name="XingTu", pixel_size_um=6.5, max_height_px=1024),
     "Daheng": CameraSpec(name="Daheng", pixel_size_um=9.0, max_height_px=1600),
+    "PhotonFocus": CameraSpec(name="PhotonFocus", pixel_size_um=9.0, max_height_px=1100),
+    # TODO UI/spec: verify the exact MV-CL021-40GM pixel size from the datasheet.
+    # max_height_px is used here as the lateral line width limit for FOV planning.
+    "HiK": CameraSpec(name="HiK", pixel_size_um=7.0, max_height_px=2048),
 }
 
 
@@ -108,9 +109,6 @@ def get_camera_spec(name):
 def get_stage_axis_spec(axis):
     return STAGE_AXIS_SPECS[str(axis)]
 
-
-def get_laser_spec(name):
-    return LASER_SPECS.get(str(name))
 
 
 def camera_step_size_um(camera_name, objective_name):

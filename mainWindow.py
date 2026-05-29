@@ -14,9 +14,9 @@ import PyQt5.QtCore as qc
 import numpy as np
 from ActionFields import *
 from Generaic_functions import *
-from HardwareSpecs import camera_step_size_um, get_camera_spec, get_laser_spec, get_objective_spec
+from HardwareSpecs import camera_step_size_um, get_camera_spec, get_objective_spec
+from CameraUi import SUPPORTED_CAMERA_NAMES, camera_sample_count
 import traceback
-from InteractiveWidget import InteractiveMosaicWidget
 # try:
 #     from traits.api import HasTraits, Instance, on_trait_change
 #     from traitsui.api import View, Item
@@ -94,34 +94,19 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+        self.limit_camera_names()
         self.LoadSettings("config.ini")
+        self.limit_camera_names()
+        self.limit_acquisition_modes()
+        self.hide_trimmed_ui_tabs()
         self.setStageMinMax()
         self.Calculate_CameraWidth_settings()
         self.Calculate_Galvo_settings()
-        ##################### Swap the old label for the new widget in your layout
-        # 1. Initialize the interactive widget
-        # We attach it directly to the existing self.ui container
-        self.ui.mosaic_viewer = InteractiveMosaicWidget(self.ui.XYplane.parent())
-
-        # 2. Replace the static QLabel in the layout
-        # This ensures the new widget appears exactly where XYplane was designed
-        layout = self.ui.XYplane.parentWidget().layout()
-        layout.replaceWidget(self.ui.XYplane, self.ui.mosaic_viewer)
-
-        # 3. Clean up the old reference
-        self.ui.XYplane.hide()
-
-        # 4. (Optional) If you want ThreadDnS to keep using the old name 'XYplane'
-        # to avoid changing too much code, just reassign it:
-        self.ui.XYplane = self.ui.mosaic_viewer
-        #################### load configuration settings
 
         # self.Update_laser()
         # self.update_galvoXwaveform()
-        # self.update_Mosaic()
-        self.ui.DepthStartBar.setMaximum(self.ui.NSamples_DH.value())
-        # self.ui.DepthStartBar.setValue(self.ui.NSamples_DH.value())
-        self.ui.DepthEndBar.setMaximum(self.ui.NSamples_DH.value())
+        self.update_depth_bar_limits()
+        # self.ui.DepthStartBar.setValue(camera_sample_count(self.ui))
         # self.ui.DepthEndBar.setValue(0)
         self.Adjust_Bline_Height()
         self.connectActions()
@@ -156,8 +141,6 @@ class MainWindow(QMainWindow):
 
     #         # self.ui.verticalLayout_2.removeWidget(self.ui.tmp_label)
     #         # self.ui.verticalLayout_2.addWidget(self.ui.mayavi_widget)
-    #         self.ui.verticalLayout_5.replaceWidget(self.ui.MUS_mosaic, self.ui.mayavi_widget)
-    #         self.ui.verticalLayout_5.removeWidget(self.ui.MUS_mosaic)
 
     def LoadSettings(self, config_filepath):
         settings = qc.QSettings(config_filepath, qc.QSettings.IniFormat)
@@ -208,6 +191,40 @@ class MainWindow(QMainWindow):
                     widget.setChecked(str(value).lower() == 'true')
                 except:
                     print(ii, ' setting missing, using default...')
+
+    def limit_acquisition_modes(self):
+        allowed_modes = [
+            'FiniteAline',
+            'ContinuousAline',
+            'FiniteBline',
+            'ContinuousBline',
+            'triggeredAcquire',
+            'FiniteCscan',
+            'ContinuousCscan',
+        ]
+        current_mode = self.ui.ACQMode.currentText()
+        self.ui.ACQMode.clear()
+        self.ui.ACQMode.addItems(allowed_modes)
+        if current_mode in allowed_modes:
+            self.ui.ACQMode.setCurrentText(current_mode)
+        else:
+            self.ui.ACQMode.setCurrentText('FiniteBline')
+
+    def limit_camera_names(self):
+        current_camera = self.ui.Camera.currentText()
+        self.ui.Camera.clear()
+        self.ui.Camera.addItems(list(SUPPORTED_CAMERA_NAMES))
+        if current_camera in SUPPORTED_CAMERA_NAMES:
+            self.ui.Camera.setCurrentText(current_camera)
+        else:
+            self.ui.Camera.setCurrentText('Daheng')
+
+    def hide_trimmed_ui_tabs(self):
+        removed_tabs = {"MosaicTab"}
+        for index in range(self.ui.Tabs.count() - 1, -1, -1):
+            widget = self.ui.Tabs.widget(index)
+            if widget is not None and widget.objectName() in removed_tabs:
+                self.ui.Tabs.removeTab(index)
 
 
     def Calculate_CameraWidth_settings(self):
@@ -264,8 +281,27 @@ class MainWindow(QMainWindow):
         self.ui.GalvoBias.setValue(self.ui.Yoffsetlength.value()/angle2mmratio)
 
     def Adjust_Bline_Height(self):
-        self.ui.DepthStart.setValue(self.ui.NSamples_DH.value() - self.ui.DepthStartBar.value())
+        try:
+            samples = camera_sample_count(self.ui)
+        except ValueError as error:
+            self.ui.statusbar.showMessage(str(error))
+            return
+        self.ui.DepthStart.setValue(samples - self.ui.DepthStartBar.value())
         self.ui.DepthRange.setValue(np.max([self.ui.DepthStartBar.value() - self.ui.DepthEndBar.value(),1]))
+
+    def update_depth_bar_limits(self):
+        try:
+            samples = camera_sample_count(self.ui)
+        except ValueError as error:
+            self.ui.statusbar.showMessage(str(error))
+            return
+        self.ui.DepthStartBar.setMaximum(samples)
+        self.ui.DepthEndBar.setMaximum(samples)
+        if self.ui.DepthStartBar.value() > samples:
+            self.ui.DepthStartBar.setValue(samples)
+        if self.ui.DepthEndBar.value() > samples:
+            self.ui.DepthEndBar.setValue(samples)
+        self.Adjust_Bline_Height()
 
     def SaveSettings(self):
         settings = qc.QSettings("config.ini", qc.QSettings.IniFormat)
@@ -294,6 +330,19 @@ class MainWindow(QMainWindow):
         self.ui.Objective.currentTextChanged.connect(self.Calculate_CameraWidth_settings)
         self.ui.Objective.currentTextChanged.connect(self.Calculate_Galvo_settings)
         self.ui.Camera.currentTextChanged.connect(self.Calculate_CameraWidth_settings)
+        self.ui.Camera.currentTextChanged.connect(self.update_depth_bar_limits)
+        if hasattr(self.ui, "NSamples_DH"):
+            self.ui.NSamples_DH.valueChanged.connect(self.update_depth_bar_limits)
+        if hasattr(self.ui, "NSamples_PF"):
+            self.ui.NSamples_PF.valueChanged.connect(self.update_depth_bar_limits)
+        if hasattr(self.ui, "NSamples_HK"):
+            self.ui.NSamples_HK.valueChanged.connect(self.update_depth_bar_limits)
+        if hasattr(self.ui, "SpectralDS_DH"):
+            self.ui.SpectralDS_DH.valueChanged.connect(self.update_depth_bar_limits)
+        if hasattr(self.ui, "SpectralDS_PF"):
+            self.ui.SpectralDS_PF.valueChanged.connect(self.update_depth_bar_limits)
+        if hasattr(self.ui, "SpectralDS_HK"):
+            self.ui.SpectralDS_HK.valueChanged.connect(self.update_depth_bar_limits)
 
         self.ui.XLength.valueChanged.connect(self.Calculate_CameraWidth_settings)
         self.ui.Xoffsetlength.valueChanged.connect(self.Calculate_CameraWidth_settings)
@@ -487,34 +536,6 @@ class MainWindow(QMainWindow):
     #         self.ui.YwaveformLabel.clear()
     #         # update iamge on the waveformLabel
     #         self.ui.YwaveformLabel.setPixmap(pixmap)
-
-    def update_Mosaic(self):
-        self.Mosaic, status = GenMosaic_XGalvo(self.ui.XStart.value(),\
-                                        self.ui.XStop.value(),\
-                                        self.ui.YStart.value(),\
-                                        self.ui.YStop.value(),\
-                                        self.ui.Xsteps.value()*self.ui.XStepSize.value()/1000,\
-                                        self.ui.Overlap.value())
-        self.ui.statusbar.showMessage(status)
-        if self.Mosaic is not None:
-            mosaic=np.zeros([2,len(self.Mosaic)*2])
-            for ii, element in enumerate(self.Mosaic):
-                if ii%2 == 0:
-                    mosaic[0,ii*2] = element.x
-                    mosaic[1,ii*2] = element.ystart
-                    mosaic[0,ii*2+1] = element.x
-                    mosaic[1,ii*2+1] = element.ystop
-                else:
-                    mosaic[0,ii*2] = element.x
-                    mosaic[1,ii*2] = element.ystop
-                    mosaic[0,ii*2+1] = element.x
-                    mosaic[1,ii*2+1] = element.ystart
-
-            pixmap = ScatterPlot(mosaic)
-            # clear content on the waveformLabel
-            self.ui.MosaicLabel.clear()
-            # update iamge on the waveformLabel
-            self.ui.MosaicLabel.setPixmap(pixmap)
 
     def Calculate_ImageDepth(self):
         self.image_depths = GenAlinesPerBlines(self.ui.ImageZStart.value(),\

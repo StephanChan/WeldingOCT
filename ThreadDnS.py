@@ -16,7 +16,6 @@ import matplotlib.pyplot as plt
 import datetime
 import os
 from pathlib import Path
-from scipy import ndimage
 # from libtiff import TIFF
 import tifffile as TIFF
 import time
@@ -32,6 +31,7 @@ ALINE_MODES = (
 BLINE_MODES = (
     AcqTypes.FINITE_BLINE,
     AcqTypes.CONTINUOUS_BLINE,
+    AcqTypes.TRIGGERED_ACQUIRE,
 )
 
 CSCAN_MODES = (
@@ -39,24 +39,12 @@ CSCAN_MODES = (
     AcqTypes.CONTINUOUS_CSCAN,
 )
 
-SAVE_SAMPLE_TIME_MODES = (
-    AcqTypes.PLATE_SCAN,
-    AcqTypes.WELL_SCAN,
-    AcqTypes.TIMED_PLATE_SCAN,
-)
-
-MOSAIC_DISPLAY_MODES = (
-    AcqTypes.PLATE_PRESCAN,
-    AcqTypes.PLATE_SCAN,
-    AcqTypes.WELL_SCAN,
-    AcqTypes.TIMED_PLATE_SCAN,
-)
+TRIGGERED_PREALLOC_ALINES = 50000
+TRIGGERED_PREVIEW_DOWNSAMPLE = 20
 
 class DnSThread(QThread):
     def __init__(self):
         super().__init__()
-        # self.SampleDynamic= []
-        self.SampleMosaic= []
         self.AIP = []
         self.Dyn = []
         # self.totalTiles = 0
@@ -66,7 +54,14 @@ class DnSThread(QThread):
         self._tiff_initialized_files = set()
         self.MeanVolume = []
         self.DynamicVolume = []
-        self.mosaic_y_pixels = None
+        self.TriggeredBlineBuffer = []
+        self.TriggeredFilledAlines = 0
+        self.TriggeredBlinePreview = []
+        self.TriggeredPreviewCanvas = []
+        self.triggered_preview_interval_s = 0.25
+        self.triggered_preview_downsample = TRIGGERED_PREVIEW_DOWNSAMPLE
+        self._last_triggered_preview_t = 0.0
+        self._triggered_first_bline_reported = False
 
     def reset_dynamic_accumulators(self):
         self.AIP = []
@@ -74,7 +69,12 @@ class DnSThread(QThread):
         self.DynBline = []
         self.MeanVolume = []
         self.DynamicVolume = []
-        self.mosaic_y_pixels = None
+        self.TriggeredBlineBuffer = []
+        self.TriggeredFilledAlines = 0
+        self.TriggeredBlinePreview = []
+        self.TriggeredPreviewCanvas = []
+        self._last_triggered_preview_t = 0.0
+        self._triggered_first_bline_reported = False
         
     def run(self):
         # self.Dynmax = self.ui.Dynmax.value()
@@ -96,13 +96,15 @@ class DnSThread(QThread):
                     self.display_actions += 1
                     self.Process_aline(self.item.data, self.item.raw, self.current_acq_mode, self.item.gpu_avg_count)
                     self._emit_display(kind="aline")
-                elif self.item.action in (
-                    AcqTypes.FINITE_BLINE,
-                    AcqTypes.CONTINUOUS_BLINE,
-                ):
+                elif self.item.action in BLINE_MODES:
                     self.Process_bline(self.item.data, self.item.raw, self.item.dynamic, self.current_acq_mode, self.item.gpu_avg_count)
-                    self.display_actions += 1
-                    self._emit_display(kind="bline")
+                    if self.item.action != AcqTypes.TRIGGERED_ACQUIRE:
+                        self.display_actions += 1
+                        self._emit_display(kind="bline")
+                    elif self.should_emit_triggered_preview():
+                        self.update_triggered_preview()
+                        self.display_actions += 1
+                        self._emit_display(kind="triggered_bline")
                 elif self.item.action in (
                     AcqTypes.FINITE_CSCAN,
                     AcqTypes.CONTINUOUS_CSCAN,
@@ -121,25 +123,14 @@ class DnSThread(QThread):
                         self.Process_Cscan(self.item.data, self.item.raw, self.current_acq_mode, self.item.gpu_avg_count)
                     self._emit_display(kind="cscan")
                     
-                elif self.item.action == DnSActions.PROCESS_MOSAIC:
-                    self.Process_Mosaic(self.item.data, self.item.raw, self.item.context, self.current_acq_mode, self.item.gpu_avg_count)
-                    self._emit_display(kind="mosaic")
-                elif self.item.action == DnSActions.RETURN_MOSAIC:
-                    self.Return_mosaic()
                 elif self.item.action == DnSActions.CLEAR:
                     self.reset_dynamic_accumulators()
                 elif self.item.action == DnSActions.DISPLAY_COUNTS:
                     self.print_display_counts(self.item.context)
-
-                elif self.item.action == DnSActions.AGAR_TILE:
-                    self.SurfFilename()
-                elif self.item.action == DnSActions.WRITE_AGAR:
-                    self.WriteAgar(self.item.data, self.item.context)
-                elif self.item.action == DnSActions.INIT_MOSAIC:
-                    self.reset_dynamic_accumulators()
-                    self.Init_Mosaic(self.item.context)
-                elif self.item.action == DnSActions.SAVE_MOSAIC:
-                    self.Save_mosaic()
+                elif self.item.action == DnSActions.FINALIZE_TRIGGERED_ACQUIRE:
+                    self.FinalizeTriggeredAcquire()
+                    self.display_actions += 1
+                    self._emit_display(kind="triggered_bline")
                 else:
                     message = f"Unknown display/save command: {self.item.action}"
                     print(message)
@@ -182,13 +173,6 @@ class DnSThread(QThread):
     def current_bline_avg(self):
         return max(1, int(self.ui.BlineAVG.value()))
 
-    def realtime_mosaic_dynamic_enabled(self, acq_mode, dynamic):
-        return (
-            self.current_dynamic_enabled()
-            and acq_mode in SAVE_SAMPLE_TIME_MODES
-            and np.size(dynamic) > 0
-        )
-
     def realtime_cscan_dynamic_enabled(self, acq_mode, dynamic):
         return (
             self.current_dynamic_enabled()
@@ -201,6 +185,22 @@ class DnSThread(QThread):
         frame_count = int(stack.shape[0]) if count is None else int(count)
         for ii in range(frame_count):
             self.write_tiff_frame(filename, stack[ii], append_if_exists=True)
+
+    @staticmethod
+    def display_data(data):
+        if isinstance(data, np.ndarray) and data.dtype.kind == 'c':
+            return np.abs(data)
+        return data
+
+    @staticmethod
+    def save_data(data):
+        if not (isinstance(data, np.ndarray) and data.dtype.kind == 'c'):
+            return data
+        z_pixels = data.shape[-1]
+        interleaved = np.empty(data.shape[:-1] + (z_pixels * 2,), dtype=np.float32)
+        interleaved[..., :z_pixels] = np.abs(data).astype(np.float32, copy=False)
+        interleaved[..., z_pixels:] = np.angle(data).astype(np.float32, copy=False)
+        return interleaved
 
     def reset_tiff_output(self, filename):
         path = Path(filename)
@@ -250,6 +250,22 @@ class DnSThread(QThread):
                 dyn = np.array(self.DynBline, copy=True)
             bridge.bline_ready.emit({"mode": acq_mode, "bline": np.array(self.Bline, copy=True), "dyn": dyn})
 
+        if kind == "triggered_bline" and hasattr(self, "Bline") and np.size(self.Bline) > 0:
+            dyn = None
+            if use_dynamic and hasattr(self, "DynBline") and np.size(self.DynBline) > 0:
+                dyn = np.array(self.DynBline, copy=True)
+            appended = None
+            if hasattr(self, "TriggeredBlinePreview") and np.size(self.TriggeredBlinePreview) > 0:
+                appended = np.array(self.TriggeredBlinePreview, copy=True)
+            bridge.bline_ready.emit(
+                {
+                    "mode": acq_mode,
+                    "bline": np.array(self.Bline, copy=True),
+                    "dyn": dyn,
+                    "appended": appended,
+                }
+            )
+
         if (
             kind == "cscan"
             and hasattr(self, "Bline")
@@ -273,14 +289,6 @@ class DnSThread(QThread):
                 }
             )
 
-        if kind == "mosaic" and hasattr(self, "SampleMosaic") and np.size(self.SampleMosaic) > 0:
-            bline = None
-            if hasattr(self, "Bline") and np.size(self.Bline) > 0:
-                bline = np.array(self.Bline, copy=True)
-            bridge.mosaic_ready.emit(
-                {"mode": acq_mode, "mosaic": np.array(self.SampleMosaic, copy=True), "bline": bline}
-            )
-            
     def print_display_counts(self, display_name = ''):
         message = f"{self.display_actions} {display_name} display update(s) completed."
         print(message)
@@ -288,14 +296,15 @@ class DnSThread(QThread):
         self.display_actions = 0
         
     def Process_aline(self, data, raw = False, acq_mode=None, gpu_avg_count=1):
-        shape = data_shape(self.ui, data, raw, acq_mode, gpu_avg_count)
+        display_data = self.display_data(data)
+        shape = data_shape(self.ui, display_data, raw, acq_mode, gpu_avg_count)
         Zpixels = shape.z_pixels
         Xpixels = shape.x_pixels
         # Bline averaging
-        if data.shape[0] > 1:
-            Ascan = np.mean(data,0)
+        if display_data.shape[0] > 1:
+            Ascan = np.mean(display_data,0)
         else:
-            Ascan = data[0]
+            Ascan = display_data[0]
         # Aline averaging if needed
         aline_avg = self.current_aline_avg()
         if aline_avg > 1:
@@ -309,16 +318,17 @@ class DnSThread(QThread):
             
     
     def Process_bline(self, data, raw = False, dynamic = [], acq_mode=None, gpu_avg_count=1):
-        shape = data_shape(self.ui, data, raw, acq_mode, gpu_avg_count)
+        display_data = self.display_data(data)
+        shape = data_shape(self.ui, display_data, raw, acq_mode, gpu_avg_count)
         Zpixels = shape.z_pixels
         Xpixels = shape.x_pixels
         if self.current_dynamic_enabled() or raw:
-            if data.shape[0] > 1:
-                Bline=np.mean(data,0)
+            if display_data.shape[0] > 1:
+                Bline=np.mean(display_data,0)
             else:
-                Bline = data[0]
+                Bline = display_data[0]
         else:
-            Bline = data[0]
+            Bline = display_data[0]
         # Aline averaging if needed
         aline_avg = self.current_aline_avg()
         if aline_avg > 1:
@@ -332,23 +342,150 @@ class DnSThread(QThread):
             self.DynBline = []
             self.Dyn = []
 
+        if acq_mode == AcqTypes.TRIGGERED_ACQUIRE:
+            self.append_triggered_bline(Bline)
+            return
         
         if self.current_save_enabled():
             self.Save(data=data, dynamic=dynamic, raw=raw, acq_mode=acq_mode, gpu_avg_count=gpu_avg_count)
 
+    def ensure_triggered_buffer_capacity(self, bline):
+        bline = np.asarray(bline)
+        x_new, z_pixels = bline.shape
+        required = int(self.TriggeredFilledAlines) + int(x_new)
+
+        needs_new = (
+            not isinstance(self.TriggeredBlineBuffer, np.ndarray)
+            or self.TriggeredBlineBuffer.ndim != 2
+            or self.TriggeredBlineBuffer.shape[1] != z_pixels
+        )
+        if needs_new:
+            capacity = max(TRIGGERED_PREALLOC_ALINES, required)
+            self.TriggeredBlineBuffer = np.zeros((capacity, z_pixels), dtype=bline.dtype)
+            self.TriggeredFilledAlines = 0
+            self.TriggeredPreviewCanvas = []
+        elif required > self.TriggeredBlineBuffer.shape[0]:
+            capacity = max(required, self.TriggeredBlineBuffer.shape[0] * 2)
+            grown = np.zeros((capacity, z_pixels), dtype=self.TriggeredBlineBuffer.dtype)
+            grown[: self.TriggeredFilledAlines, :] = self.TriggeredBlineBuffer[: self.TriggeredFilledAlines, :]
+            self.TriggeredBlineBuffer = grown
+            self.TriggeredPreviewCanvas = []
+
+        return required
+
+    def append_triggered_bline(self, bline):
+        bline = np.asarray(bline)
+        self.ensure_triggered_buffer_capacity(bline)
+        x_new = int(bline.shape[0])
+        x0 = int(self.TriggeredFilledAlines)
+        x1 = x0 + x_new
+        if not self._triggered_first_bline_reported:
+            edge_width = min(20, x_new)
+            edge_mean = float(np.mean(bline[:edge_width, :])) if edge_width > 0 else 0.0
+            full_mean = float(np.mean(bline)) if bline.size > 0 else 0.0
+            print(
+                "triggeredAcquire first B-line check: "
+                f"first {edge_width} A-line mean={edge_mean:.3f}, "
+                f"full B-line mean={full_mean:.3f}"
+            )
+            self._triggered_first_bline_reported = True
+        self.TriggeredBlineBuffer[x0:x1, :] = bline
+        self.TriggeredFilledAlines = x1
+
+    def should_emit_triggered_preview(self):
+        now = time.monotonic()
+        if now - self._last_triggered_preview_t < self.triggered_preview_interval_s:
+            return False
+        self._last_triggered_preview_t = now
+        return True
+
+    def ensure_triggered_preview_canvas(self):
+        if self.TriggeredFilledAlines <= 0 or not isinstance(self.TriggeredBlineBuffer, np.ndarray):
+            self.TriggeredBlinePreview = []
+            return None, 1
+        downsample = max(1, int(self.triggered_preview_downsample))
+        preview_width = int(np.ceil(self.TriggeredBlineBuffer.shape[0] / float(downsample)))
+        z_pixels = int(self.TriggeredBlineBuffer.shape[1])
+        if (
+            not isinstance(self.TriggeredPreviewCanvas, np.ndarray)
+            or self.TriggeredPreviewCanvas.shape != (preview_width, z_pixels)
+            or self.TriggeredPreviewCanvas.dtype != self.TriggeredBlineBuffer.dtype
+        ):
+            self.TriggeredPreviewCanvas = np.zeros(
+                (preview_width, z_pixels),
+                dtype=self.TriggeredBlineBuffer.dtype,
+            )
+        return self.TriggeredPreviewCanvas, downsample
+
+    def downsample_triggered_preview(self, data, downsample):
+        if downsample <= 1 or data.shape[0] <= 1:
+            return data
+        complete_rows = (data.shape[0] // downsample) * downsample
+        blocks = []
+        if complete_rows > 0:
+            blocks.append(
+                data[:complete_rows, :].reshape(-1, downsample, data.shape[1]).mean(axis=1)
+            )
+        if complete_rows < data.shape[0]:
+            blocks.append(data[complete_rows:, :].mean(axis=0, keepdims=True))
+        if len(blocks) == 1:
+            return blocks[0]
+        return np.vstack(blocks)
+
+    def update_triggered_preview(self):
+        canvas, downsample = self.ensure_triggered_preview_canvas()
+        if canvas is None:
+            return
+        filled_preview_cols = int(np.ceil(self.TriggeredFilledAlines / float(downsample)))
+        if filled_preview_cols > 0:
+            valid = self.TriggeredBlineBuffer[: self.TriggeredFilledAlines, :]
+            preview = self.downsample_triggered_preview(valid, downsample)
+            canvas[: preview.shape[0], :] = preview
+        self.TriggeredBlinePreview = np.transpose(canvas)
+        print(
+            "triggeredAcquire appended A-lines: "
+            f"{self.TriggeredFilledAlines} "
+            f"(preview downsample={downsample}, preview columns={filled_preview_cols}/{canvas.shape[0]})"
+        )
+
+    def FinalizeTriggeredAcquire(self):
+        if self.TriggeredFilledAlines <= 0 or not isinstance(self.TriggeredBlineBuffer, np.ndarray):
+            self.Bline = []
+            self.DynBline = []
+            self.TriggeredBlinePreview = []
+            self.TriggeredPreviewCanvas = []
+            return
+
+        valid = self.TriggeredBlineBuffer[: self.TriggeredFilledAlines, :]
+        downsample = max(1, int(self.triggered_preview_downsample))
+        final_preview = self.downsample_triggered_preview(valid, downsample)
+        self.TriggeredBlinePreview = np.transpose(final_preview)
+        print(
+            "triggeredAcquire final appended A-lines: "
+            f"{self.TriggeredFilledAlines} (display downsample={downsample})"
+        )
+
+        if self.current_save_enabled():
+            bundle = self.item.filename_bundle or {}
+            filename = bundle.get("filename")
+            if not filename:
+                raise RuntimeError("Missing triggeredAcquire filename bundle.")
+            self.write_tiff_frame(filename, np.transpose(valid), append_if_exists=False)
+
             
     def Process_Cscan_Dynamic(self, data, dynamic=[], acq_mode=None, gpu_avg_count=1):
         # print(dynamic.shape)
-        shape = data_shape(self.ui, data, False, acq_mode, gpu_avg_count)
+        display_data = self.display_data(data)
+        shape = data_shape(self.ui, display_data, False, acq_mode, gpu_avg_count)
         Zpixels = shape.z_pixels
         Xpixels = shape.x_pixels
         Ypixels = self.current_y_pixels()
         dynamic_bline_idx = int(self.item.dynamic_bline_idx or 0)
         # Bline averaging
-        if data.shape[0] > 1:
-            Bline=np.mean(data,0)
+        if display_data.shape[0] > 1:
+            Bline=np.mean(display_data,0)
         else:
-            Bline = data[0]
+            Bline = display_data[0]
         # Aline averaging if needed
         aline_avg = self.current_aline_avg()
         if aline_avg > 1:
@@ -381,7 +518,8 @@ class DnSThread(QThread):
         
         
     def Process_Cscan(self, data, raw = False, acq_mode=None, gpu_avg_count=1):
-        shape = data_shape(self.ui, data, raw, acq_mode, gpu_avg_count)
+        display_data = self.display_data(data)
+        shape = data_shape(self.ui, display_data, raw, acq_mode, gpu_avg_count)
         Zpixels = shape.z_pixels
         Xpixels = shape.x_pixels
         Ypixels = shape.y_pixels
@@ -389,10 +527,10 @@ class DnSThread(QThread):
         bline_avg = self.current_bline_avg()
         if raw and bline_avg > 1:
             # reshape into Ypixels x Xpixels x Zpixels
-            Cscan = data.reshape([Ypixels, bline_avg, Xpixels,Zpixels])
+            Cscan = display_data.reshape([Ypixels, bline_avg, Xpixels,Zpixels])
             Cscan=np.mean(Cscan,1)
         else:
-            Cscan = data.copy()
+            Cscan = display_data.copy()
         # Aline averaging if needed
         aline_avg = self.current_aline_avg()
         if aline_avg > 1:
@@ -409,16 +547,17 @@ class DnSThread(QThread):
             self.Save(data=data, raw=raw, acq_mode=acq_mode, gpu_avg_count=gpu_avg_count)
 
     def Process_Cscan_RealtimeDynamic(self, data, dynamic=[], acq_mode=None, gpu_avg_count=1):
-        shape = data_shape(self.ui, data, False, acq_mode, gpu_avg_count)
+        display_data = self.display_data(data)
+        shape = data_shape(self.ui, display_data, False, acq_mode, gpu_avg_count)
         zpixels = shape.z_pixels
         xpixels = shape.x_pixels
         ypixels = self.current_y_pixels()
         dynamic_bline_idx = int(self.item.dynamic_bline_idx or 0)
 
-        if data.shape[0] > 1:
-            bline = np.mean(data, 0)
+        if display_data.shape[0] > 1:
+            bline = np.mean(display_data, 0)
         else:
-            bline = data[0]
+            bline = display_data[0]
 
         dyn_slice = np.asarray(dynamic, dtype=np.float32)
         aline_avg = self.current_aline_avg()
@@ -448,156 +587,15 @@ class DnSThread(QThread):
             if self.current_save_enabled():
                 self.SaveRealtimeCscanDynamicVolumes(acq_mode)
             
-   
-    def Init_Mosaic(self, context):
-        """
-        Initializes the mosaic buffer based on the physical span of all FOVs.
-        context: [fov_locs, fov_size_px, fov_size_mm]
-        fov_locs: list of FOVLocation in mm
-        fov_size_px: (width_px, height_px) e.g., (1000, 2000)
-        fov_size_mm: (width_mm, height_mm) e.g., (2.0, 3.0)
-        """
-        fov_locs, fov_size_px, fov_size_mm = context
-        fw_px, fh_px = fov_size_px
-        fw_mm, fh_mm = fov_size_mm
-        
-        # 1. Find the bounding box of the FOV centers
-        # print(fov_locs)
-        xs = [location.x for location in fov_locs]
-        ys = [location.y for location in fov_locs]
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
-        # 2. Calculate how many tiles are needed in each dimension
-        # We use round() to handle tiny stage step errors
-        num_cols = int(round((max_x - min_x) / fw_mm)) + 1
-        num_rows = int(round((max_y - min_y) / fh_mm)) + 1
-        
-        # 3. Initialize/Overwrite the active mosaic buffer
-        mw_px = num_cols * fw_px
-        mh_px = num_rows * fh_px
-        self.SampleMosaic = np.ones((mh_px, mw_px), dtype=np.float32)*10
-        # print(self.SampleMosaic.shape)
-        # Store these for use in Process_Mosaic
-        self.fw_mm, self.fh_mm = fw_mm, fh_mm
-        self.fw_px, self.fh_px = fw_px, fh_px
-        self.mosaic_y_pixels = int(fh_px)
-        
-        print(f"Mosaic Initialized: {num_cols}x{num_rows} tiles ({mw_px}x{mh_px} px)")
-        
     def Focusing(self, cscan):
          print(cscan.shape)
-
          bscan = cscan.mean(0)
-
          ascan = bscan.mean(0)
          print(ascan.shape)
          surfHeight = findchangept(ascan,1)
-
-         ##########################################################
          self.ui.SurfHeight.setValue(surfHeight)
-         message = 'Detected tile surface height: '+str(surfHeight)
+         message = 'Detected surface height: '+str(surfHeight)
          print(message)
- 
-    def Process_Mosaic(self, data, raw=False, context=None, acq_mode=None, gpu_avg_count=1):
-        """
-        Stitches the FOV into the mosaic by calculating its grid index from the anchor.
-        context: [fov_locs, fov_location]
-        """
-        fov_locs, fov_location = context
-        fov_x, fov_y = fov_location.x, fov_location.y
-        xs = [location.x for location in fov_locs]
-        ys = [location.y for location in fov_locs]
-        min_x = min(xs)
-        min_y = min(ys)
-        # 1. Generate AIP projection from raw data (Y, X, Z)
-        if self.realtime_mosaic_dynamic_enabled(acq_mode, getattr(self.item, "dynamic", [])):
-            self.Process_Mosaic_RealtimeDynamic(
-                data,
-                self.item.dynamic,
-                acq_mode=acq_mode,
-                gpu_avg_count=gpu_avg_count,
-            )
-        elif self.current_dynamic_enabled():
-            self.Process_Cscan_Dynamic(data, self.item.dynamic, acq_mode=acq_mode, gpu_avg_count=gpu_avg_count)
-        else:
-            self.Process_Cscan(data, raw, acq_mode=acq_mode, gpu_avg_count=gpu_avg_count)
-        # 2. Calculate the Grid Index (Column and Row)
-        # We determine how many FOV-widths away from the minimum X/Y we are
-        col_idx = int(round((fov_x - min_x) / self.fw_mm))
-        row_idx = int(round((fov_y - min_y) / self.fh_mm))
-        # 3. Calculate pixel offsets
-        off_x = col_idx * self.fw_px
-        off_y = row_idx * self.fh_px
-
-        # 4. Paste into the mosaic buffer
-        # Bounds checking added just in case of unexpected stage travel
-        # print('sampleMosaic: ', self.SampleMosaic)
-        mh, mw = self.SampleMosaic.shape
-        y1, y2 = off_y, off_y + self.fh_px
-        x1, x2 = off_x, off_x + self.fw_px
-        # print(x1,x2,y1,y2)
-        
-        if y2 <= mh and x2 <= mw:
-            # print(y1,y2,x1,x2, off_y, off_x, mh, mw)
-            self.SampleMosaic[y1:y2, x1:x2] = self.AIP
-        else:
-            print(f"Warning: Tile at ({col_idx}, {row_idx}) is out of mosaic bounds.")
-
-        # 5. Update UI
-
-    def Process_Mosaic_RealtimeDynamic(self, data, dynamic, acq_mode=None, gpu_avg_count=1):
-        shape = data_shape(self.ui, data, False, acq_mode, gpu_avg_count)
-        Zpixels = shape.z_pixels
-        Xpixels = shape.x_pixels
-        Ypixels = int(self.mosaic_y_pixels or self.current_y_pixels())
-        dynamic_bline_idx = int(self.item.dynamic_bline_idx or 0)
-
-        if data.shape[0] > 1:
-            Bline = np.mean(data, 0)
-        else:
-            Bline = data[0]
-
-        DynSlice = np.asarray(dynamic, dtype=np.float32)
-        aline_avg = self.current_aline_avg()
-        if aline_avg > 1:
-            Bline = Bline.reshape([Xpixels // aline_avg, aline_avg, Zpixels]).mean(axis=1)
-            DynSlice = DynSlice.reshape([Xpixels // aline_avg, aline_avg, Zpixels]).mean(axis=1)
-            Xpixels = Xpixels // aline_avg
-
-        if (
-            not isinstance(self.MeanVolume, np.ndarray)
-            or self.MeanVolume.shape != (Ypixels, Xpixels, Zpixels)
-            or dynamic_bline_idx == 0
-        ):
-            self.MeanVolume = np.zeros((Ypixels, Xpixels, Zpixels), dtype=np.float32)
-            self.DynamicVolume = np.zeros((Ypixels, Xpixels, Zpixels), dtype=np.float32)
-            self.AIP = np.zeros((Ypixels, Xpixels), dtype=np.float32)
-            self.Dyn = np.zeros((Ypixels, Xpixels), dtype=np.float32)
-
-        self.Bline = np.transpose(Bline)
-        self.DynBline = np.transpose(DynSlice)
-
-        self.MeanVolume[dynamic_bline_idx, :, :] = Bline
-        self.DynamicVolume[dynamic_bline_idx, :, :] = DynSlice
-        self.AIP[dynamic_bline_idx, :] = np.mean(Bline, axis=1)
-        self.Dyn[dynamic_bline_idx, :] = np.mean(DynSlice, axis=1)
-
-        tile_complete = dynamic_bline_idx + 1 == Ypixels
-        if tile_complete:
-            if self.current_save_enabled():
-                self.SaveRealtimeMosaicDynamicVolumes(acq_mode)
-
-    def SaveRealtimeMosaicDynamicVolumes(self, acq_mode):
-        bundle = self.item.filename_bundle
-        dynamic_filename = bundle.get("dynamic_filename")
-        mean_filename = bundle.get("mean_filename")
-        if not dynamic_filename or not mean_filename:
-            raise RuntimeError("Missing realtime mosaic dynamic filename bundle.")
-        try:
-            TIFF.imwrite(dynamic_filename, np.asarray(self.DynamicVolume, dtype=np.float32), append=False)
-            TIFF.imwrite(mean_filename, np.asarray(self.MeanVolume, dtype=np.float32), append=False)
-        finally:
-            pass
 
     def SaveRealtimeCscanDynamicVolumes(self, acq_mode):
         bundle = self.item.filename_bundle
@@ -616,24 +614,11 @@ class DnSThread(QThread):
         tif = TIFF.open(filename, mode=overlap)
         tif.write_image(image)
         tif.close()
-        
-    def Return_mosaic(self):
-        self.MosaicQueue.put(self.SampleMosaic)
-        # self.Focusing(self.cscan_sum)
-        
-
-        
-    def Save_mosaic(self):
-        if self.current_save_enabled():
-            slice_num = self.ui.SliceN.value()
-            filename = self.ui.DIR.toPlainText()+'/aip/slice'+str(slice_num)+'coase.tif'
-            TIFF.imwrite(filename, self.SampleMosaic, append=False)
-            
-        
     def Save(self, data=[], dynamic=[], raw=False, acq_mode=None, gpu_avg_count=1):
         if getattr(self.item, "skip_save", False):
             return
         shape = data_shape(self.ui, data, raw, acq_mode, gpu_avg_count)
+        data_to_save = self.save_data(data)
         Zpixels = shape.z_pixels
         Xpixels = shape.x_pixels
         Yrpt = shape.repeat_count
@@ -643,7 +628,7 @@ class DnSThread(QThread):
             filename = bundle.get("filename")
             if not filename:
                 raise RuntimeError("Missing aline filename bundle.")
-            self.write_stack_tiff(filename, data, Yrpt)
+            self.write_stack_tiff(filename, data_to_save, Yrpt)
                 
         elif acq_mode in BLINE_MODES:
             filename = bundle.get("filename")
@@ -652,7 +637,7 @@ class DnSThread(QThread):
                 raise RuntimeError("Missing bline filename bundle.")
             if dyn_filename is not None and np.size(dynamic) > 0:
                 self.write_tiff_frame(dyn_filename, dynamic, append_if_exists=False)
-            self.write_stack_tiff(filename, data, Yrpt)
+            self.write_stack_tiff(filename, data_to_save, Yrpt)
                 
         elif acq_mode in CSCAN_MODES:
             if self.current_dynamic_enabled():
@@ -662,25 +647,14 @@ class DnSThread(QThread):
                 dyn_filename = bundle.get("dynamic_filename")
                 if not bline_filename or not dyn_filename:
                     raise RuntimeError("Missing cscan dynamic filename bundle.")
-                self.write_stack_tiff(bline_filename, data, Yrpt)
+                self.write_stack_tiff(bline_filename, data_to_save, Yrpt)
                 if np.size(dynamic) > 0:
                     self.write_tiff_frame(dyn_filename, dynamic, append_if_exists=True)
             else:
                 filename = bundle.get("filename")
                 if not filename:
                     raise RuntimeError("Missing cscan filename bundle.")
-                self.write_stack_tiff(filename, data, Ypixels)
-        elif acq_mode in MOSAIC_DISPLAY_MODES:
-            if self.current_dynamic_enabled():
-                filename = bundle.get("filename")
-                if not filename:
-                    raise RuntimeError("Missing mosaic dynamic filename bundle.")
-                self.write_stack_tiff(filename, data, Yrpt)
-            else:
-                filename = bundle.get("filename")
-                if not filename:
-                    raise RuntimeError("Missing mosaic filename bundle.")
-                self.write_stack_tiff(filename, data, Ypixels)
+                self.write_stack_tiff(filename, data_to_save, Ypixels)
 
     def WriteData(self, data, filename):
         filePath = self.ui.DIR.toPlainText()

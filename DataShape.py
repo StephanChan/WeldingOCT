@@ -1,20 +1,13 @@
 from dataclasses import dataclass
 
 from ActionTypes import AcqTypes
+from CameraUi import camera_sample_count
 
 
 CSCAN_MODES = (
     AcqTypes.FINITE_CSCAN,
     AcqTypes.CONTINUOUS_CSCAN,
 )
-
-MOSAIC_DISPLAY_MODES = (
-    AcqTypes.PLATE_PRESCAN,
-    AcqTypes.PLATE_SCAN,
-    AcqTypes.WELL_SCAN,
-    AcqTypes.TIMED_PLATE_SCAN,
-)
-
 
 @dataclass(frozen=True)
 class DataShapeInfo:
@@ -29,11 +22,13 @@ def depth_pixels(ui, data=None, raw=False):
     if data is not None and getattr(data, "ndim", 0) >= 3:
         return int(data.shape[2])
     if raw:
-        return int(ui.NSamples_DH.value())
+        return camera_sample_count(ui)
     return int(ui.DepthRange.value())
 
 
-def x_pixels(ui):
+def x_pixels(ui, data=None):
+    if data is not None and getattr(data, "ndim", 0) >= 2:
+        return int(data.shape[1])
     return int(ui.AlinesPerBline.value())
 
 
@@ -48,7 +43,7 @@ def repeat_count(ui, data=None, raw=False, acq_mode=None, gpu_avg_count=1):
     if not raw:
         return frame_count
 
-    if acq_mode in CSCAN_MODES + MOSAIC_DISPLAY_MODES:
+    if acq_mode in CSCAN_MODES:
         if frame_count > configured_bline_avg and frame_count % configured_bline_avg == 0:
             return configured_bline_avg
     return frame_count
@@ -73,6 +68,6 @@ def data_shape(ui, data=None, raw=False, acq_mode=None, gpu_avg_count=1):
         frame_count=frame_count,
         y_pixels=cscan_y_count(ui, data, raw) if data is not None else max(1, int(ui.Ypixels.value())),
         repeat_count=repeat_count(ui, data, raw, acq_mode, gpu_avg_count),
-        x_pixels=x_pixels(ui),
+        x_pixels=x_pixels(ui, data),
         z_pixels=depth_pixels(ui, data, raw),
     )
