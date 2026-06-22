@@ -310,6 +310,10 @@ class GPUThread(QThread):
     def current_y_pixels(self):
         return max(1, int(self.ui.Ypixels.value()))
 
+    def current_alines_per_bline(self):
+        aline_avg = max(1, int(self.ui.AlineAVG.value()))
+        return max(1, int(self.ui.AlinesPerBline.value())) * aline_avg
+
     def current_fft_result_mode(self):
         if hasattr(self.ui, "FFTresults"):
             return self.ui.FFTresults.currentText()
@@ -1100,14 +1104,23 @@ class GPUThread(QThread):
         # get samples per Aline
         samples = self.current_nsamples()
         # print('GPU dispersion samples: ',samples)
-        Xpixels = self.ui.AlinesPerBline.value()
+        Xpixels = self.current_alines_per_bline()
         # self.window = np.float32(np.hanning(samples))
         # update dispersion and window
         background_path = self.ui.BG_DIR.text()
         # print(dispersion_path+'/dspPhase.bin')
         if os.path.isfile(background_path):
             try:
-                self.background  = np.float32(np.fromfile(background_path, dtype=np.float32)).reshape([Xpixels,samples])
+                raw_background = np.float32(np.fromfile(background_path, dtype=np.float32))
+                expected_values = int(Xpixels) * int(samples)
+                if raw_background.size != expected_values:
+                    raise ValueError(
+                        "background value count mismatch: "
+                        f"file_values={raw_background.size}, "
+                        f"expected={expected_values}, "
+                        f"shape=({int(Xpixels)}, {int(samples)})"
+                    )
+                self.background = raw_background.reshape([Xpixels, samples])
                 background_mean = float(np.mean(self.background))
                 if np.isfinite(background_mean) and background_mean > self.static_normalization_eps:
                     self.static_normalization_mean = background_mean

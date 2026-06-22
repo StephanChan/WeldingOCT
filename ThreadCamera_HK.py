@@ -590,7 +590,12 @@ class Camera(QThread):
         ret = self.cam.MV_CC_ConvertPixelTypeEx(cvt)
         check_ret(ret, "convert HiK frame to Mono16 failed")
         data = np.ctypeslib.as_array(cast(cvt.pDstBuffer, POINTER(c_ushort)), shape=(width * height,))
-        return data.reshape(height, width).copy()
+        data = data.reshape(height, width).copy()
+        if info.enPixelType == PixelType_Gvsp_Mono12_Packed:
+            data >>= 4
+        elif info.enPixelType == PixelType_Gvsp_Mono10_Packed:
+            data >>= 6
+        return data
 
     def Acquire(self):
         NBlines = self.Memory[0].shape[0]

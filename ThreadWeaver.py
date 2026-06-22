@@ -95,7 +95,7 @@ class WeaverThread(QThread):
                     self.finish_with_message(message)
 
                 elif self.item.action == WeaverActions.GET_BACKGROUND:
-                    message = self.get_background_cscan()
+                    message = self.get_background()
                     self.finish_with_message(message)
 
                 elif self.item.action == WeaverActions.GET_SURFACE:
@@ -677,9 +677,6 @@ class WeaverThread(QThread):
         return message
 
     def get_background(self):
-        self.AODOQueue.put(AODOActionField("rotate_servo_out"))
-        self.StagebackQueue.get()
-
         acq_mode = self.ui.ACQMode.currentText()
         fft_device = self.ui.FFTDevice.currentText()
         bline_avg = self.ui.BlineAVG.value()
@@ -688,7 +685,7 @@ class WeaverThread(QThread):
 
         self.ui.ACQMode.setCurrentText(AcqTypes.FINITE_BLINE)
         self.ui.FFTDevice.setCurrentText("None")
-        self.ui.BlineAVG.setValue(100)
+        self.ui.BlineAVG.setValue(10)
         self.ui.DynCheckBox.setChecked(False)
         self.ui.RealtimeDynCheckBox.setChecked(False)
         self.ui.RunButton.setChecked(True)
@@ -715,8 +712,6 @@ class WeaverThread(QThread):
         self.ui.DynCheckBox.setChecked(dyn_checked)
         self.ui.RealtimeDynCheckBox.setChecked(realtime_dyn_checked)
 
-        self.AODOQueue.put(AODOActionField("rotate_servo_back"))
-        self.StagebackQueue.get()
         return "Background measurement completed."
 
     def get_background_cscan(self):
