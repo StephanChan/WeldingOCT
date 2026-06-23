@@ -31,7 +31,7 @@ from CameraUi import (
 
 global SIM
 
-MVS_DEV_ROOT = r"D:\Apps\MVS\Development"
+MVS_DEV_ROOT = r"D:\MVS\MVS\Development"
 MVS_RUNTIME_DIR = r"C:\Program Files (x86)\Common Files\MVS\Runtime\Win64_x64"
 
 CONTINUOUS = 0x7FFFFFFF
